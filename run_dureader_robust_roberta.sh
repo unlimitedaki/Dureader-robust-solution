@@ -1,0 +1,21 @@
+python run_dureader_robust_roberta_large.py \
+    --data_dir "dataset" \
+    --train_file "train.json" \
+    --dev_file "dev.json" \
+    --test_file "test1.json" \
+    --output_dir "model" \
+    --model_name_or_path 'chinese-roberta' \
+    --save_model_name 'roberta-large-chinese-dureader-robust' \
+    --do_train \
+    --do_finetune \
+    --max_seq_length 512 \
+    --max_answer_length 20 \
+    --doc_stride 128 \
+    --gradient_accumulation_steps 3 \
+    --num_train_epochs 5\
+    --adam_epsilon 1e-8 \
+    --learning_rate 3e-5 \
+    --warmup_steps 0 \
+    --train_batch_size 12\
+    --eval_batch_size 12\
+    --n_best_size 20\
