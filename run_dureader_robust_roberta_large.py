@@ -3,8 +3,8 @@ import os
 import sys
 import time
 import re
-if os.path.exists("/home/aistudio/work/external-libraries"):
-    sys.path.append('/home/aistudio/work/external-libraries')
+if os.path.exists("external-libraries"):
+    sys.path.append('external-libraries')
 import numpy as np
 import torch
 import torch.nn as nn
@@ -545,9 +545,23 @@ class SquadProcessor(object):
         ) as reader:
             input_data = json.load(reader)["data"]
         return self._create_examples(input_data, "dev")
+    
+    def get_test_examples(self,data_dir,filename = None):
+        if data_dir is None:
+            data_dir = ""
+
+        # if self.dev_file is None:
+        #     raise ValueError("SquadProcessor should be instantiated via SquadV1Processor or SquadV2Processor")
+
+        with open(
+            os.path.join(data_dir, self.dev_file if filename is None else filename), "r", encoding="utf-8"
+        ) as reader:
+            input_data = json.load(reader)["data"]
+        return self._create_examples(input_data, "test")
 
     def _create_examples(self, input_data, set_type):
         is_training = set_type == "train"
+        is_test = set_type == "test"
         examples = []
         for entry in tqdm(input_data):
             title = entry["title"]
@@ -570,8 +584,8 @@ class SquadProcessor(object):
                             answer = qa["answers"][0]
                             answer_text = answer["text"]
                             start_position_character = answer["answer_start"]
-                        else:
-                            answers = qa["answers"]
+                        elif not is_test:
+                            answers = qa['answers']
 
                     example = SquadExample(
                         qas_id=qas_id,
@@ -744,19 +758,26 @@ class SquadResult(object):
             self.cls_logits = cls_logits
 
 
-def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False):
+def load_and_cache_examples(args, tokenizer,evaluate=False, output_examples=False,test = False,prefix = ""):
     if args.local_rank not in [-1, 0] and not evaluate:
         # Make sure only the first process in distributed training process the dataset, and the others will use the cache
         torch.distributed.barrier()
 
     # Load data features from cache or dataset file
     input_dir = args.data_dir if args.data_dir else "."
+    if evaluate:
+        data_type = "dev"
+    elif test:
+        data_type = "test"
+    else:
+        data_type = "train"
     cached_features_file = os.path.join(
         input_dir,
-        "cached_{}_{}_{}".format(
-            "dev" if evaluate else "train",
+        "cached_{}_{}_{}_{}".format(
+            data_type,
             list(filter(None, args.model_name_or_path.split("/"))).pop(),
             str(args.max_seq_length),
+            prefix
         ),
     )
 
@@ -788,6 +809,8 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
         processor = SquadProcessor()
         if evaluate:
             examples = processor.get_dev_examples(args.data_dir, filename=args.dev_file)
+        elif test :
+            examples = processor.get_test_examples(args.data_dir,filename=args.test_file)
         else:
             examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
 
@@ -797,7 +820,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
             max_seq_length=args.max_seq_length,
             doc_stride=args.doc_stride,
             max_query_length=args.max_query_length,
-            is_training=not evaluate,
+            is_training=not evaluate and not test,
             return_dataset="pt",
             threads=args.threads,
         )
@@ -880,9 +903,12 @@ def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 def evaluate(args, model, tokenizer, device,prefix=""):
-    dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True, output_examples=True)
+    if prefix == 'test':
+        dataset,examples,features = load_and_cache_examples(args, tokenizer, test = True, output_examples=True,prefix = prefix)
+    else:
+        dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True, output_examples=True,prefix = prefix)
 
-    output_dir = os.path.join(args.output_dir,args.model_name_or_path)
+    output_dir = os.path.join(args.output_dir,args.save_model_name)
     if not os.path.exists(output_dir) and args.local_rank in [-1, 0]:
         os.makedirs(output_dir)
 
@@ -977,6 +1003,8 @@ def evaluate(args, model, tokenizer, device,prefix=""):
     )
 
     # Compute the F1 and exact scores.
+    if prefix == "test":
+        return 
     results = squad_evaluate(examples, predictions)
     return results
 
@@ -1021,10 +1049,9 @@ def train(args):
         model = BertForQuestionAnswering.from_pretrained(model_dir)
     
     model.to(device)
-    # if args.do_finetune:
-    #     result = evaluate(args,model,tokenizer,device)
-    #     print(result)
-    #     logger.info("dev_result_%s",str(result))
+    
+    # result = evaluate(args,model,tokenizer,device)
+    # logger.info("dev_result_%s",str(result))
     # Prepare optimizer and schedule (linear warmup and decay)
     t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
     no_decay = ["bias", "LayerNorm.weight"]
@@ -1088,6 +1115,33 @@ def train(args):
             logger.info("dev_result_%s",str(result))
         # p len(example.context_text)+len(example.question_text)+len(example.answer_text)
 
+def test(arges):
+    output_dir = os.path.join(args.output_dir,args.save_model_name)
+    #device
+    if args.use_tpu :
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        import torch_xla.debug.metrics as met
+        import torch_xla.distributed.parallel_loader as pl
+        import torch_xla.distributed.xla_multiprocessing as xmp
+        import torch_xla.utils.utils as xu
+        device = xm.xla_device()
+    else:
+        device = torch.device('cuda:0')
+    
+    model_dir = os.path.join("model",'chinese_roberta_wwm_large_ext_pytorch')
+    tokenizer = BertTokenizer.from_pretrained(model_dir)
+    status_dir = os.path.join(output_dir,"status.json")
+    status = json.load(open(status_dir,'r'))
+    current_model = os.path.join(output_dir, 'checkpoint-{}'.format(status["current_epoch"]))
+    model = BertForQuestionAnswering.from_pretrained(current_model)
+    model.to(device)
+    if args.do_eval:
+        evaluate(args,model,tokenizer,device,prefix = args.dev_file)
+    else:
+        evaluate(args,model,tokenizer,device,prefix = "test")
+
+
 import pdb
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -1122,9 +1176,10 @@ parser.add_argument("--eval_batch_size", default=6, type=int, help="Batch size f
 parser.add_argument("--n_best_size",default=20,type=int,help="The total number of n-best predictions to generate in the nbest_predictions.json output file.")
 parser.add_argument("--null_score_diff_threshold",type=float,default=0.0,help="If null_score - best_non_null is greater than the threshold predict null.")
 # settings
-parser.add_argument("--do_train",action="store_true",help = "Whether to train")
+parser.add_argument("--do_train",action="store_true",default = False,help = "Whether to train")
 parser.add_argument("--do_finetune",action = "store_true", default = False)
 parser.add_argument("--do_eval",action="store_true",default = False , help= "Whether to evaluate")
+parser.add_argument("--do_test",action = "store_true",default = False,help = "Whether to test")
 parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
 parser.add_argument("--overwrite_cache",type = bool,default = False)
 parser.add_argument("--use_tpu",type = bool,default = False)
@@ -1136,5 +1191,9 @@ args = parser.parse_args()
 
 if args.do_train:
     train(args)
+if args.do_test:
+    test(args)
+if not args.do_train and args.do_eval:
+    test(args)
 #loading data
 
