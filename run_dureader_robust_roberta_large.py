@@ -16,6 +16,7 @@ from torchvision import transforms
 from transformers import BertTokenizer,BertModel
 from transformers import AdamW,get_linear_schedule_with_warmup
 from transformers import BertPreTrainedModel
+from transformers import PreTrainedTokenizer
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.nn import CrossEntropyLoss
 from tqdm import trange, tqdm
@@ -29,7 +30,7 @@ from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
 from processor import load_and_cache_examples,SquadResult,SquadFeatures,SquadExample
-from model import BertForQuestionAnswering
+from model import BertForQuestionAnswering,BertForQuestionAnsweringWithMaskedLM
 import evaluate as Eval
 from squad_metrics import compute_predictions_logits,squad_evaluate
 import timeit
@@ -47,6 +48,41 @@ from torch.utils.data import TensorDataset
 #     import tensorflow as tf
 
 logger = logging.getLogger(__name__)
+
+# mask !
+def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args):
+    """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
+
+    if tokenizer.mask_token is None:
+        raise ValueError(
+            "This tokenizer does not have a mask token which is necessary for masked language modeling. Remove the --mlm flag if you want to use this tokenizer."
+        )
+
+    labels = inputs.clone()
+    # We sample a few tokens in each sequence for masked-LM training (with probability args.mlm_probability defaults to 0.15 in Bert/RoBERTa)
+    probability_matrix = torch.full(labels.shape, args.mlm_probability)
+    special_tokens_mask = [
+        tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
+    ]
+    probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
+    if tokenizer._pad_token is not None:
+        padding_mask = labels.eq(tokenizer.pad_token_id)
+        probability_matrix.masked_fill_(padding_mask, value=0.0)
+    masked_indices = torch.bernoulli(probability_matrix).bool()
+    labels[~masked_indices] = -100  # We only compute loss on masked tokens
+
+    # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
+    indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
+    inputs[indices_replaced] = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+
+    # 10% of the time, we replace masked input tokens with random word
+    indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
+    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long)
+    inputs[indices_random] = random_words[indices_random]
+
+    # The rest of the time (10% of the time) we keep the masked input tokens unchanged
+    return inputs, labels
+
 
 def to_list(tensor):
     return tensor.detach().cpu().tolist()
@@ -197,11 +233,11 @@ def train(args):
         status_dir = os.path.join(output_dir,"status.json")
         status = json.load(open(status_dir,'r'))
         current_model = os.path.join(output_dir, "current_model")
-        model = BertForQuestionAnswering.from_pretrained(current_model)
+        model = BertForQuestionAnsweringWithMaskedLM.from_pretrained(current_model)
         
     else:
         origin_dir = os.path.join(args.output_dir,args.origin_model)
-        model = BertForQuestionAnswering.from_pretrained(origin_dir)
+        model = BertForQuestionAnsweringWithMaskedLM.from_pretrained(origin_dir)
         status = {}
         status['best_epoch'] = 0
         status['best_EM'] = 0.0
@@ -234,23 +270,36 @@ def train(args):
     # F1,EM = evaluate(args,model,tokenizer,device)
     # logger.info("Dev F1 = %s, EM = %s on epoch %s",str(F1),str(EM),str(-1))
     # Train!
+    
     for epoch in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         tr_loss = 0
         
-        
+        task_split  =  torch.rand(len(epoch_iterator))
+        mlm_proportion = float(2/3)
         for step, batch in enumerate(epoch_iterator):
             model.train()
-            batch = tuple(t.to(device) for t in batch)
-
-            inputs = {
-                "input_ids": batch[0],
-                "attention_mask": batch[1],
-                "token_type_ids": batch[2],
-                "start_positions": batch[3],
-                "end_positions": batch[4],
-            }
-
+            if task_split[step] <  mlm_proportion:
+                input_ids,masked_lm_labels = mask_tokens(batch[0],tokenizer,args) 
+                masked_lm_labels = masked_lm_labels.to(device)
+                input_ids = input_ids.to(device)
+                batch = tuple(t.to(device) for t in batch)
+                
+                inputs =   {
+                    "input_ids": input_ids,
+                    "attention_mask": batch[1],
+                    "token_type_ids": batch[2],
+                    "masked_lm_labels":masked_lm_labels,
+                }
+            else:
+                batch = tuple(t.to(device) for t in batch)
+                inputs = {
+                    "input_ids": batch[0],
+                    "attention_mask": batch[1],
+                    "token_type_ids": batch[2],
+                    "start_positions": batch[3],
+                    "end_positions": batch[4],
+                }
             outputs = model(**inputs)
             # model outputs are always tuple in transformers (see doc)
             loss = outputs[0]
@@ -318,11 +367,12 @@ def test(arges):
     tokenizer = BertTokenizer.from_pretrained(model_dir)
     status_dir = os.path.join(output_dir,"status.json")
     status = json.load(open(status_dir,'r'))
-    current_model = os.path.join(output_dir, args.target_model)
-    model = BertForQuestionAnswering.from_pretrained(current_model)
+    target_model = os.path.join(output_dir, args.target_model)
+    model = BertForQuestionAnsweringWithMaskedLM.from_pretrained(target_model)
     model.to(device)
     if args.do_eval:
-        evaluate(args,model,tokenizer,device,data_type = 'dev',prefix = args.dev_file.split('.')[0])
+        F1,EM = evaluate(args,model,tokenizer,device,data_type = 'dev',prefix = args.dev_file.split('.')[0])
+        logger.info("Dev on %s F1 = %s, EM = %s on %s",args.dev_file,str(F1),str(EM),str(args.target_model))
     else:
         evaluate(args,model,tokenizer,device,data_type = 'test',prefix = args.test_file.split('.')[0])
 
@@ -362,18 +412,21 @@ parser.add_argument("--eval_batch_size", default=6, type=int, help="Batch size f
 parser.add_argument("--n_best_size",default=20,type=int,help="The total number of n-best predictions to generate in the nbest_predictions.json output file.")
 parser.add_argument("--null_score_diff_threshold",type=float,default=0.0,help="If null_score - best_non_null is greater than the threshold predict null.")
 parser.add_argument("--check_loss_step",default = 800,type = int,help = "output current average loss of training")
+parser.add_argument("--mlm_probability",default = 0.2,type = float,help = "mask probability of mlm")
 # settings
 parser.add_argument("--do_train",action="store_true",default = False,help = "Whether to train")
 parser.add_argument("--do_finetune",action = "store_true", default = False)
 parser.add_argument("--do_eval",action="store_true",default = False , help= "Whether to evaluate")
 parser.add_argument("--do_test",action = "store_true",default = False,help = "Whether to test")
 parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
+parser.add_argument("--mlm",action = "store_true",help = "Whether to train mask language model")
 parser.add_argument("--overwrite_cache",type = bool,default = False)
 parser.add_argument("--use_tpu",type = bool,default = False)
 parser.add_argument("--n_gpu",type=int , default = 1)
 parser.add_argument("--verbose_logging",action="store_true",help="If true, all of the warnings related to data processing will be printed. A number of warnings are expected for a normal SQuAD evaluation.",)
-parser.add_argument("--do_lower_case", action="store_true", help="Set this flag if you are using an uncased model.")
+parser.add_argument("--do_lower_case", action="store_true",help="Set this flag if you are using an uncased model.")
 parser.add_argument("--target_model",type = str)
+# paeser.add_argument("--save_nbest",action = 'store_true',help = "Whether to save nbest predictions")
 # parser.add_arg
 args = parser.parse_args()
 

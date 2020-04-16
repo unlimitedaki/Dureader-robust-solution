@@ -385,7 +385,7 @@ def compute_predictions_logits(
 ):
     """Write final predictions to the json file and log-odds of null if needed."""
     logger.info("Writing predictions to: %s" % (output_prediction_file))
-    logger.info("Writing nbest to: %s" % (output_nbest_file))
+    # logger.info("Writing nbest to: %s" % (output_nbest_file))
 
     example_index_to_features = collections.defaultdict(list)
     for feature in all_features:
@@ -464,11 +464,10 @@ def compute_predictions_logits(
                 )
             )
         prelim_predictions = sorted(prelim_predictions, key=lambda x: (x.start_logit + x.end_logit), reverse=True)
-
         _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name
             "NbestPrediction", ["text", "start_logit", "end_logit"]
         )
-
+        
         seen_predictions = {}
         nbest = []
         for pred in prelim_predictions:
@@ -557,8 +556,8 @@ def compute_predictions_logits(
     with open(output_prediction_file, "w") as writer:
         writer.write(json.dumps(all_predictions, indent=4,ensure_ascii=False) + "\n")
 
-    with open(output_nbest_file, "w") as writer:
-        writer.write(json.dumps(all_nbest_json, indent=4,ensure_ascii=False) + "\n")
+    # with open(output_nbest_file, "w") as writer:
+    #     writer.write(json.dumps(all_nbest_json, indent=4,ensure_ascii=False) + "\n")
 
     if version_2_with_negative:
         with open(output_null_log_odds_file, "w") as writer:
