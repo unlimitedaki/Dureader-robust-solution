@@ -5,6 +5,7 @@ import time
 import re
 if os.path.exists("external-libraries"):
     sys.path.append('external-libraries')
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -83,6 +84,14 @@ def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args):
     # The rest of the time (10% of the time) we keep the masked input tokens unchanged
     return inputs, labels
 
+def make_answer_content(inputs,start_positions,end_positions):
+    # pdb.set_trace()
+    shape = inputs.shape[0:2]
+    answer_content_labels = torch.zeros(shape,dtype=torch.long)
+    for i,(start_position,end_position) in enumerate(zip(start_positions,end_positions)):
+        answer_content_labels[i][start_position:end_position] = torch.ones((end_position-start_position),dtype=torch.long)
+    return answer_content_labels
+    
 
 def to_list(tensor):
     return tensor.detach().cpu().tolist()
@@ -270,16 +279,20 @@ def train(args):
     # F1,EM = evaluate(args,model,tokenizer,device)
     # logger.info("Dev F1 = %s, EM = %s on epoch %s",str(F1),str(EM),str(-1))
     # Train!
-    
+    ## 随机分配mlm和mrc顺序，保证比例
+    # pdb.set_trace()
+    if args.mlm:
+        task_split = torch.cat((torch.ones(2*len(train_dataloader)),torch.zeros(len(train_dataloader))))
+        task_split = task_split[torch.randperm(task_split.size(0))]
+
     for epoch in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         tr_loss = 0
         
-        task_split  =  torch.rand(len(epoch_iterator))
         mlm_proportion = float(2/3)
         for step, batch in enumerate(epoch_iterator):
             model.train()
-            if task_split[step] <  mlm_proportion:
+            if args.mlm and task_split[(epoch%3)*len(train_dataloader)+step] ==1 :
                 input_ids,masked_lm_labels = mask_tokens(batch[0],tokenizer,args) 
                 masked_lm_labels = masked_lm_labels.to(device)
                 input_ids = input_ids.to(device)
@@ -292,6 +305,11 @@ def train(args):
                     "masked_lm_labels":masked_lm_labels,
                 }
             else:
+                if args.acp:
+                    answer_content_labels = make_answer_content(batch[0],batch[3],batch[4])
+                    answer_content_labels = answer_content_labels.to(device)
+                else:
+                    answer_content_labels = None
                 batch = tuple(t.to(device) for t in batch)
                 inputs = {
                     "input_ids": batch[0],
@@ -299,6 +317,7 @@ def train(args):
                     "token_type_ids": batch[2],
                     "start_positions": batch[3],
                     "end_positions": batch[4],
+                    "answer_content_labels":answer_content_labels
                 }
             outputs = model(**inputs)
             # model outputs are always tuple in transformers (see doc)
@@ -413,6 +432,7 @@ parser.add_argument("--n_best_size",default=20,type=int,help="The total number o
 parser.add_argument("--null_score_diff_threshold",type=float,default=0.0,help="If null_score - best_non_null is greater than the threshold predict null.")
 parser.add_argument("--check_loss_step",default = 800,type = int,help = "output current average loss of training")
 parser.add_argument("--mlm_probability",default = 0.2,type = float,help = "mask probability of mlm")
+parser.add_argument("--loss_beta",default = 0,type = float,help = " weight of answer content loss ")
 # settings
 parser.add_argument("--do_train",action="store_true",default = False,help = "Whether to train")
 parser.add_argument("--do_finetune",action = "store_true", default = False)
@@ -426,6 +446,7 @@ parser.add_argument("--n_gpu",type=int , default = 1)
 parser.add_argument("--verbose_logging",action="store_true",help="If true, all of the warnings related to data processing will be printed. A number of warnings are expected for a normal SQuAD evaluation.",)
 parser.add_argument("--do_lower_case", action="store_true",help="Set this flag if you are using an uncased model.")
 parser.add_argument("--target_model",type = str)
+parser.add_argument("--acp",action = "store_true",help = "whether to do answer content prediction")
 # paeser.add_argument("--save_nbest",action = 'store_true',help = "Whether to save nbest predictions")
 # parser.add_arg
 args = parser.parse_args()
