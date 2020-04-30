@@ -5,6 +5,7 @@ import time
 import re
 if os.path.exists("external-libraries"):
     sys.path.append('external-libraries')
+from apex import amp
 import random
 import numpy as np
 import torch
@@ -255,7 +256,7 @@ def train(args):
         # status['global_step'] = 0
         
     model.to(device)
-    
+    model = amp.initialize(model,opt_level="O1")
     # Prepare optimizer and schedule (linear warmup and decay)
     t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
     no_decay = ["bias", "LayerNorm.weight"]
@@ -270,7 +271,7 @@ def train(args):
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
     )
-
+    model, optimizer = amp.initialize(model, optimizer, opt_level="O1") 
     tr_loss = 0.0
     # global_step = 0
     model.zero_grad()
@@ -310,6 +311,7 @@ def train(args):
                     answer_content_labels = answer_content_labels.to(device)
                 else:
                     answer_content_labels = None
+                # pdb.set_trace()
                 batch = tuple(t.to(device) for t in batch)
                 inputs = {
                     "input_ids": batch[0],
@@ -324,7 +326,9 @@ def train(args):
             loss = outputs[0]
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
-            loss.backward()
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
+            # loss.backward()
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -389,12 +393,101 @@ def test(arges):
     target_model = os.path.join(output_dir, args.target_model)
     model = BertForQuestionAnsweringWithMaskedLM.from_pretrained(target_model)
     model.to(device)
+    model = amp.initialize(model,opt_level="O1")
     if args.do_eval:
         F1,EM = evaluate(args,model,tokenizer,device,data_type = 'dev',prefix = args.dev_file.split('.')[0])
         logger.info("Dev on %s F1 = %s, EM = %s on %s",args.dev_file,str(F1),str(EM),str(args.target_model))
     else:
         evaluate(args,model,tokenizer,device,data_type = 'test',prefix = args.test_file.split('.')[0])
 
+def convert_text_file_to_squad(data_dir,file_name):
+    eval_file_name = os.path.join(args.data_dir,file_name)
+    data = {}
+    data["data"] = []
+    entry = {}
+    entry['title'] = "api_test"
+    entry['paragraphs'] = []
+    id = 0
+    with open(eval_file_name,'r',encoding= 'utf8') as f:
+        for line in f:
+            line = line.strip().split("|")
+            item = {}
+            item["context"] = line[0]
+            item["qas"] = []
+            qas = {}
+            qas["id"] = id
+            id+=1
+            qas['question'] = line[1]
+            item['qas'].append(qas)
+            entry['paragraphs'].append(item)
+    data["data"].append(entry)
+    squad_file_name = "squad_{}.json".format(file_name.split('.')[0])
+    with open(os.path.join(args.data_dir,squad_file_name),'w',encoding = 'utf8') as f:
+        json.dump(data,f)
+    return squad_file_name,entry['paragraphs']
+
+
+def api(args):
+    output_dir = os.path.join(args.output_dir,args.save_model_name)
+    #device
+    if args.use_tpu :
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        import torch_xla.debug.metrics as met
+        import torch_xla.distributed.parallel_loader as pl
+        import torch_xla.distributed.xla_multiprocessing as xmp
+        import torch_xla.utils.utils as xu
+        device = xm.xla_device()
+    else:
+        device = torch.device('cuda:0')
+    
+    model_dir = os.path.join("model",'chinese_roberta_wwm_large_ext_pytorch')
+    tokenizer = BertTokenizer.from_pretrained(model_dir)
+    status_dir = os.path.join(output_dir,"status.json")
+    status = json.load(open(status_dir,'r'))
+    target_model = os.path.join(output_dir, args.target_model)
+    model = BertForQuestionAnsweringWithMaskedLM.from_pretrained(target_model)
+    model.to(device)
+    model = amp.initialize(model,opt_level="O1")
+    while(1):
+        if args.api_file == None:
+            logger.info("未配置api测试文件，手动输入测试文件")
+            eval_file_name = input("文件名：")
+            
+            squad_file_name, examples = convert_text_file_to_squad(args.data_dir,eval_file_name)
+            evaluate(args,model,tokenizer,device,data_type = 'test',prefix = squad_file_name.split('.')[0])
+            output_dir = os.path.join(args.output_dir,args.save_model_name)
+            output_prediction_file = os.path.join(output_dir, "predictions_{}.json".format(squad_file_name.split('.')[0]))
+            prediction = json.load(open(output_prediction_file)) 
+            prediction_with_context = []
+            for p in examples:
+                item = {}
+                item['context'] = p["context"]
+                item['question'] = p["qas"][0]["question"]
+                # pdb.set_trace()
+                item['prediction'] = prediction[str(p["qas"][0]["id"])]
+                prediction_with_context.append(item)
+                print(item)
+            with open( "predictions_{}_with_context.json".format(squad_file_name.split('.')[0]),'w',encoding= 'utf8') as f:
+                json.dump(prediction_with_context,f)
+        else:
+            squad_file_name, examples = convert_text_file_to_squad(args.data_dir,args.api_file)
+            evaluate(args,model,tokenizer,device,data_type = 'test',prefix = squad_file_name.split('.')[0])
+            output_dir = os.path.join(args.output_dir,args.save_model_name)
+            output_prediction_file = os.path.join(output_dir, "predictions_{}.json".format(squad_file_name.split('.')[0]))
+            prediction = json.load(open(output_prediction_file)) 
+            prediction_with_context = []
+            for p in examples:
+                item = {}
+                item['context'] = p["context"]
+                item['question'] = p["qas"][0]["question"]
+                pdb.set_trace()
+                item['prediction'] = prediction[str(p["qas"][0]["id"])]
+                prediction_with_context.append(item)
+                print(item)
+            with open( "predictions_{}_with_context.json".format(squad_file_name.split('.')[0]),'w',encoding= 'utf8') as f:
+                json.dump(prediction_with_context,f)
+            
 
 import pdb
 
@@ -412,6 +505,7 @@ parser.add_argument("--test_file",type = str)
 parser.add_argument("--output_dir",type = str,default = 'model')
 parser.add_argument("--save_model_name",type = str,default = "")
 parser.add_argument("--origin_model",type = str,default = "chinese_roberta_wwm_large_ext_pytorch", help = "origin model dir for training")
+parser.add_argument("--api_file",type = str,default = None,help = "real time api runner")
 # hyper parameters
 parser.add_argument("--model_name_or_path",type = str,default = 'chinese-roberta')
 parser.add_argument("--local_rank",type =int,default = -1)
@@ -438,6 +532,7 @@ parser.add_argument("--do_train",action="store_true",default = False,help = "Whe
 parser.add_argument("--do_finetune",action = "store_true", default = False)
 parser.add_argument("--do_eval",action="store_true",default = False , help= "Whether to evaluate")
 parser.add_argument("--do_test",action = "store_true",default = False,help = "Whether to test")
+parser.add_argument("--api",action = "store_true",help = "use api")
 parser.add_argument("--threads", type=int, default=1, help="multiple threads for converting example to features")
 parser.add_argument("--mlm",action = "store_true",help = "Whether to train mask language model")
 parser.add_argument("--overwrite_cache",type = bool,default = False)
@@ -457,5 +552,7 @@ if args.do_test:
     test(args)
 if not args.do_train and args.do_eval:
     test(args)
+if args.api:
+    api(args)
 #loading data
 

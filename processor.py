@@ -9,7 +9,7 @@ import torch
 from multiprocessing import Pool, cpu_count
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from functools import partial
-
+import pdb
 
 logger = logging.getLogger(__name__)
 def _improve_answer_span(doc_tokens, input_start, input_end, tokenizer, orig_answer_text):
@@ -723,7 +723,7 @@ class SquadResult(object):
             self.cls_logits = cls_logits
 
 
-def load_and_cache_examples(args, tokenizer,data_type, output_examples=False,prefix = ""):
+def load_and_cache_examples(args, tokenizer,data_type, output_examples=False,prefix = None):
     if args.local_rank not in [-1, 0] and not evaluate:
         # Make sure only the first process in distributed training process the dataset, and the others will use the cache
         torch.distributed.barrier()
@@ -769,7 +769,11 @@ def load_and_cache_examples(args, tokenizer,data_type, output_examples=False,pre
         if data_type == "dev":
             examples = processor.get_dev_examples(args.data_dir, filename=args.dev_file)
         elif data_type == "test":
-            examples = processor.get_test_examples(args.data_dir,filename=args.test_file)
+            if prefix is not None:
+                test_file = "{}.json".format(prefix)
+            else:
+                test_file = args.test_file
+            examples = processor.get_test_examples(args.data_dir,filename=test_file)
         else:
             examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
 
